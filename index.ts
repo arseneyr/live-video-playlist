@@ -1,4 +1,4 @@
-import HLS, { types as hlsTypes } from "hls-parser";
+import HLS from "https://esm.sh/hls-parser@0.10.4?pin=v78";
 
 type HLSPlaylist = hlsTypes.MediaPlaylist;
 

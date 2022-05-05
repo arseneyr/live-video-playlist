@@ -1,0 +1,3 @@
+/* esm.sh - hls-parser@0.10.4 */
+export * from "https://cdn.esm.sh/v78/hls-parser@0.10.4/deno/hls-parser.js";
+export { default } from "https://cdn.esm.sh/v78/hls-parser@0.10.4/deno/hls-parser.js";

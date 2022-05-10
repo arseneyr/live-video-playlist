@@ -4,6 +4,7 @@ import { asserts, HLS } from "./deps.ts";
 const MIN_PLAYLIST_TD_MULTIPLE = 3;
 
 type HLSPlaylist = HLS.types.MediaPlaylist;
+type HLSSegment = HLS.types.Segment;
 
 interface IVideo {
   hlsPlaylist: string;
@@ -38,172 +39,115 @@ function isMediaPlaylist(
   return playlist.isMasterPlaylist;
 }
 
-function assertIterValue<T>(
-  i: IteratorResult<T>,
-): asserts i is IteratorYieldResult<T> {
-  if (i.done === true) {
-    throw new Error("iterator improperly finished");
+function mapNext<T, U, R, N>(
+  asyncIterator: AsyncIterator<T, R, N>,
+  mapFn: (item: T) => U,
+): AsyncIterator<U, R, N> {
+  return {
+    ...asyncIterator,
+    next: async (...args) => {
+      const { done, value } = await asyncIterator.next(...args);
+      if (!done) {
+        return { done, value: mapFn(value) };
+      }
+      return { done, value };
+    },
+  } as AsyncIterator<U, R, N>;
+}
+
+function filter<T, R, N, S extends T>(
+  asyncIterator: AsyncIterator<T, R, N>,
+  filterFn: (item: T) => item is S,
+): AsyncIterator<S, R, N> {
+  return {
+    ...asyncIterator,
+    next: async (...args) => {
+      let val = await asyncIterator.next(...args);
+      while (!val.done && !filterFn(val.value)) {
+        val = await asyncIterator.next(...args);
+      }
+      return val;
+    },
+  } as AsyncIterator<S, R, N>;
+}
+
+async function* getNextVideo(fn: GetNextVideo) {
+  if (isAsyncIterable(fn) || isIterable(fn)) {
+    return yield* fn;
+  }
+  for (;;) {
+    const val = await fn();
+    if (!val) {
+      return;
+    }
+    yield val;
   }
 }
 
-class LiveVideoPlaylist {
-  readonly #targetDuration: number;
-  readonly #fallbackPlaceholder: ParsedVideo | string;
-  readonly #videoIterator: AsyncIterator<IVideo>;
+function getVideoOrFallback(
+  video: Promise<IVideo>,
+  fallback: HLSSegment,
+): Promise<IVideo | HLSSegment> {
+  return Promise.race([
+    video,
+    new Promise<HLSSegment>((res) => setTimeout(() => res(fallback))),
+  ]);
+}
 
-  #segments: HLS.types.Segment[] = [];
-  #mediaSequence = 0;
-  #discontinuitySequence = 0;
-  #currentVideo?: AsyncIterator<HLS.types.Segment>;
-
-  constructor(options: LiveVideoPlaylistOptions) {
-    HLS.setOptions({ strictMode: true });
-
-    this.#videoIterator = this.#getNextVideo(options.getNextVideo);
-    this.#targetDuration = options.targetDuration;
-    if (
-      !Number.isInteger(options.targetDuration) ||
-      options.targetDuration < 1
-    ) {
-      throw new Error("target duration must be a positive integer");
-    }
-    if (typeof options.fallbackPlaceholder === "string") {
-      this.#fallbackPlaceholder = options.fallbackPlaceholder;
-    } else {
-      const hlsPlaylist = this.#parseHlsPlaylist(
-        options.fallbackPlaceholder.hlsPlaylist,
-      );
-      this.#fallbackPlaceholder = {
-        ...options.fallbackPlaceholder,
-        hlsPlaylist,
-      };
-    }
+function livePlaylist(options: LiveVideoPlaylistOptions) {
+  const { targetDuration } = options;
+  if (
+    !Number.isInteger(targetDuration) ||
+    targetDuration < 1
+  ) {
+    throw new Error("target duration must be a positive integer");
   }
-
-  get #segmentsDuration() {
-    return this.#segments.reduce((acc, cur) => acc + cur.duration, 0);
-  }
-
-  async #fillSegments() {
-    while (
-      this.#segmentsDuration < (this.#targetDuration * MIN_PLAYLIST_TD_MULTIPLE)
-    ) {
-    }
-  }
-
-  async *#getNextSegment(): AsyncGenerator<
-    HLS.types.Segment,
-    void,
-    IVideo | undefined
-  > {
-    const getVideoOrFallback = (
-      video: Promise<IteratorResult<IVideo>>,
-      fallback: Iterator<HLS.types.Segment>,
-    ) => {
-      return Promise.race([
-        video,
-        new Promise<HLS.types.Segment>((res) =>
-          setTimeout(() => {
-            const seg = fallback.next();
-            asserts.assert(!seg.done);
-            res(seg.value);
-          })
-        ),
-      ]);
-    };
-    let currentVideoPromise = this.#videoIterator.next();
-    for (;;) {
-      const placeholderIterator = this.#getPlaceholder();
-      let newVid: IVideo | undefined;
-      let segmentOrVideo: HLS.types.Segment | IteratorResult<IVideo>;
-      for (
-        segmentOrVideo = await getVideoOrFallback(
-          currentVideoPromise,
-          placeholderIterator,
-        );
-        segmentOrVideo instanceof HLS.types.Segment;
-        segmentOrVideo = await getVideoOrFallback(
-          currentVideoPromise,
-          placeholderIterator,
-        )
-      ) {
-        if (segmentOrVideo.mediaSequenceNumber === 0) {
-          segmentOrVideo.discontinuitySequence = this.#discontinuitySequence++;
-          segmentOrVideo.discontinuity = true;
-        }
-        newVid = yield segmentOrVideo;
-        if (newVid) {
-          break;
-        }
-      }
-      if ("done" in segmentOrVideo && segmentOrVideo.done) {
-        return;
-      }
-      if (newVid) {
-        currentVideoPromise = Promise.resolve({ done: false, value: newVid });
-        continue;
-      }
-      asserts.assert("value" in segmentOrVideo);
+  const videoIterable = (async function* () {
+    for await (let v of getNextVideo(options.getNextVideo)) {
       try {
-        const playlist = this.#parseHlsPlaylist(
-          segmentOrVideo.value.hlsPlaylist,
-        );
-        for (
-          let i = 0;
-          i < playlist.segments.length && newVid === undefined;
-          ++i
-        ) {
-          newVid = yield playlist.segments[i];
-        }
+        yield {
+          ...v,
+          hlsPlaylist: parseHlsPlaylist(v.hlsPlaylist),
+        } as ParsedVideo;
       } catch (err) {
-        segmentOrVideo.value.onError?.(err);
+        v.onError?.(err);
       }
-
-      currentVideoPromise = this.#videoIterator.next();
     }
-  }
+  })();
+  const placeholder = typeof options.fallbackPlaceholder === "string"
+    ? options.fallbackPlaceholder
+    : parseHlsPlaylist(options.fallbackPlaceholder.hlsPlaylist);
 
-  async *#getNextVideo(fn: GetNextVideo) {
-    if (isAsyncIterable(fn) || isIterable(fn)) {
-      return yield* fn;
-    }
-    for (;;) {
-      const val = await fn();
-      if (!val) {
-        return;
-      }
-      yield val;
-    }
-  }
-
-  *#getPlaceholder() {
+  const placeholderIterable = (function* () {
     for (let i = 0;; ++i) {
-      if (typeof this.#fallbackPlaceholder === "string") {
-        const segment = new HLS.types.Segment({
-          uri: this.#fallbackPlaceholder,
-          duration: this.#targetDuration,
+      if (typeof placeholder === "string") {
+        yield new HLS.types.Segment({
+          uri: placeholder,
+          duration: targetDuration,
           mediaSequenceNumber: 0,
           discontinuitySequence: 0,
         });
       } else {
-        const segments = this.#fallbackPlaceholder.hlsPlaylist.segments;
+        const segments = placeholder.segments;
         yield segments[i % segments.length];
       }
     }
-  }
+  })();
 
-  #parseHlsPlaylist(playlist: string): HLSPlaylist {
+  function parseHlsPlaylist(
+    playlist: string,
+  ): HLSPlaylist {
     const parsedPlaylist = HLS.parse(playlist);
     if (!isMediaPlaylist(parsedPlaylist)) {
       throw new Error("only media playlists supported");
     }
-    if (parsedPlaylist.targetDuration > this.#targetDuration) {
+    if (parsedPlaylist.targetDuration > targetDuration) {
       throw new Error(
         "playlist target duration longer than configured target duration",
       );
     }
     return parsedPlaylist;
   }
-}
 
-export default LiveVideoPlaylist;
+  let pendingVideo: ParsedVideo | null = null;
+}

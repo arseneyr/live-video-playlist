@@ -84,41 +84,32 @@ async function* getNextVideo(fn: GetNextVideo) {
   }
 }
 
-function getVideoOrFallback(
-  video: Promise<IVideo>,
-  fallback: HLSSegment,
-): Promise<IVideo | HLSSegment> {
+function getPromiseOrFallback<T, U>(
+  p: Promise<T>,
+  fallback: U,
+): Promise<T | U> {
   return Promise.race([
-    video,
-    new Promise<HLSSegment>((res) => setTimeout(() => res(fallback))),
+    p,
+    new Promise<U>((res) => setTimeout(() => res(fallback))),
   ]);
 }
 
 function livePlaylist(options: LiveVideoPlaylistOptions) {
   const { targetDuration } = options;
+  let pendingVideo: ParsedVideo | null = null;
+  let discontinuitySequence = 0;
+  let mediaSequenceNumber = 0;
   if (
     !Number.isInteger(targetDuration) ||
     targetDuration < 1
   ) {
     throw new Error("target duration must be a positive integer");
   }
-  const videoIterable = (async function* () {
-    for await (let v of getNextVideo(options.getNextVideo)) {
-      try {
-        yield {
-          ...v,
-          hlsPlaylist: parseHlsPlaylist(v.hlsPlaylist),
-        } as ParsedVideo;
-      } catch (err) {
-        v.onError?.(err);
-      }
-    }
-  })();
   const placeholder = typeof options.fallbackPlaceholder === "string"
     ? options.fallbackPlaceholder
     : parseHlsPlaylist(options.fallbackPlaceholder.hlsPlaylist);
 
-  const placeholderIterable = (function* () {
+  const placeholderGenerator = function* () {
     for (let i = 0;; ++i) {
       if (typeof placeholder === "string") {
         yield new HLS.types.Segment({
@@ -129,7 +120,59 @@ function livePlaylist(options: LiveVideoPlaylistOptions) {
         });
       } else {
         const segments = placeholder.segments;
+        if (i % segments.length === 0) {
+          segments[0].discontinuity = true;
+        }
         yield segments[i % segments.length];
+      }
+    }
+  };
+  const userVideoIterable = (async function* () {
+    for await (const v of getNextVideo(options.getNextVideo)) {
+      try {
+        yield {
+          ...v,
+          hlsPlaylist: parseHlsPlaylist(v.hlsPlaylist),
+        } as ParsedVideo;
+      } catch (err) {
+        v.onError?.(err);
+      }
+    }
+  })();
+  const segmentIterable = (async function* () {
+    for (;;) {
+      let video: ParsedVideo | null = pendingVideo;
+      if (video) {
+        pendingVideo = null;
+      } else {
+        const p = userVideoIterable.next();
+        for (const placeholder of placeholderGenerator()) {
+          const v = await getPromiseOrFallback(p, placeholder);
+          if (pendingVideo) {
+            video = pendingVideo;
+            pendingVideo = null;
+            break;
+          }
+          if (v instanceof HLS.types.Segment) {
+            yield v;
+          } else if (v.done) {
+            return;
+          } else {
+            video = v.value;
+            break;
+          }
+        }
+      }
+      asserts.assert(video);
+      for (let i = 0; i < video.hlsPlaylist.segments.length; i++) {
+        const segment = video.hlsPlaylist.segments[i];
+        if (i === 0) {
+          segment.discontinuity = true;
+        }
+        yield segment;
+        if (pendingVideo) {
+          break;
+        }
       }
     }
   })();
@@ -141,13 +184,28 @@ function livePlaylist(options: LiveVideoPlaylistOptions) {
     if (!isMediaPlaylist(parsedPlaylist)) {
       throw new Error("only media playlists supported");
     }
-    if (parsedPlaylist.targetDuration > targetDuration) {
+    if (
+      parsedPlaylist.segments.some((v) =>
+        Math.round(v.duration) > targetDuration
+      )
+    ) {
       throw new Error(
-        "playlist target duration longer than configured target duration",
+        "playlist contains segments longer than configured target duration",
       );
     }
     return parsedPlaylist;
   }
 
-  let pendingVideo: ParsedVideo | null = null;
+  function playNow(video: IVideo) {
+    try {
+      pendingVideo = {
+        ...video,
+        hlsPlaylist: parseHlsPlaylist(video.hlsPlaylist),
+      };
+    } catch (err) {
+      video.onError?.(err);
+    }
+  }
+
+  return { playNow };
 }

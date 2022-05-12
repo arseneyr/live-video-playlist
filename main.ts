@@ -39,38 +39,6 @@ function isMediaPlaylist(
   return playlist.isMasterPlaylist;
 }
 
-function mapNext<T, U, R, N>(
-  asyncIterator: AsyncIterator<T, R, N>,
-  mapFn: (item: T) => U,
-): AsyncIterator<U, R, N> {
-  return {
-    ...asyncIterator,
-    next: async (...args) => {
-      const { done, value } = await asyncIterator.next(...args);
-      if (!done) {
-        return { done, value: mapFn(value) };
-      }
-      return { done, value };
-    },
-  } as AsyncIterator<U, R, N>;
-}
-
-function filter<T, R, N, S extends T>(
-  asyncIterator: AsyncIterator<T, R, N>,
-  filterFn: (item: T) => item is S,
-): AsyncIterator<S, R, N> {
-  return {
-    ...asyncIterator,
-    next: async (...args) => {
-      let val = await asyncIterator.next(...args);
-      while (!val.done && !filterFn(val.value)) {
-        val = await asyncIterator.next(...args);
-      }
-      return val;
-    },
-  } as AsyncIterator<S, R, N>;
-}
-
 async function* getNextVideo(fn: GetNextVideo) {
   if (isAsyncIterable(fn) || isIterable(fn)) {
     return yield* fn;
@@ -94,7 +62,11 @@ function getPromiseOrFallback<T, U>(
   ]);
 }
 
-function livePlaylist(options: LiveVideoPlaylistOptions) {
+function getDuration(s: Iterable<HLSSegment>): number {
+  return Array.from(s).reduce((acc, cur) => acc + cur.duration, 0);
+}
+
+async function livePlaylist(options: LiveVideoPlaylistOptions) {
   const { targetDuration } = options;
   let pendingVideo: ParsedVideo | null = null;
   let discontinuitySequence = 0;
@@ -196,6 +168,13 @@ function livePlaylist(options: LiveVideoPlaylistOptions) {
     return parsedPlaylist;
   }
 
+  async function fillPlaylist(existing: HLSSegment[]) {
+    const ret = existing.slice();
+    while (getDuration(ret) < MIN_PLAYLIST_TD_MULTIPLE * targetDuration) {
+      ret.push(await segmentIterable.next());
+    }
+  }
+
   function playNow(video: IVideo) {
     try {
       pendingVideo = {
@@ -207,5 +186,9 @@ function livePlaylist(options: LiveVideoPlaylistOptions) {
     }
   }
 
+  await 1;
+
   return { playNow };
 }
+
+export default livePlaylist;

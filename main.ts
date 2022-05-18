@@ -1,4 +1,6 @@
-import { asserts, HLS } from "./deps.ts";
+import { asserts, delay, HLS } from "./deps.ts";
+
+HLS.setOptions({ strictMode: true });
 
 // https://www.rfc-editor.org/rfc/rfc8216.html#section-6.2.2
 const MIN_PLAYLIST_TD_MULTIPLE = 3;
@@ -9,10 +11,15 @@ type HLSSegment = HLS.types.Segment;
 interface IVideo {
   hlsPlaylist: string;
   onPlay?: () => unknown;
+  onComplete?: (segmentUri: string, lastSegment: boolean) => unknown;
   onError?: (err: Error) => unknown;
 }
 
 type ParsedVideo = Omit<IVideo, "hlsPlaylist"> & { hlsPlaylist: HLSPlaylist };
+type ParsedSegment = Pick<IVideo, "onPlay" | "onComplete"> & {
+  segment: HLSSegment;
+  first: boolean;
+};
 
 type GetNextVideo =
   | AsyncIterable<IVideo>
@@ -22,7 +29,7 @@ type GetNextVideo =
 interface LiveVideoPlaylistOptions {
   targetDuration: number;
   getNextVideo: GetNextVideo;
-  fallbackPlaceholder: IVideo | string;
+  fallbackPlaceholder?: Pick<IVideo, "hlsPlaylist" | "onPlay"> | string;
 }
 
 function isIterable(x: any): x is Iterable<unknown> {
@@ -36,7 +43,8 @@ function isAsyncIterable(x: any): x is AsyncIterable<unknown> {
 function isMediaPlaylist(
   playlist: HLS.types.Playlist,
 ): playlist is HLS.types.MediaPlaylist {
-  return playlist.isMasterPlaylist;
+  return playlist instanceof HLS.types.MediaPlaylist &&
+    !playlist.isMasterPlaylist;
 }
 
 async function* getNextVideo(fn: GetNextVideo) {
@@ -52,21 +60,100 @@ async function* getNextVideo(fn: GetNextVideo) {
   }
 }
 
-function getPromiseOrFallback<T, U>(
-  p: Promise<T>,
-  fallback: U,
-): Promise<T | U> {
-  return Promise.race([
-    p,
-    new Promise<U>((res) => setTimeout(() => res(fallback))),
-  ]);
+function getSegmentsDurationMs(s: Iterable<{ segment: HLSSegment }>): number {
+  return Array.from(s).reduce(
+    (acc, cur) => acc + cur.segment.duration * 1000,
+    0,
+  );
 }
 
-function getDuration(s: Iterable<HLSSegment>): number {
-  return Array.from(s).reduce((acc, cur) => acc + cur.duration, 0);
+function* placeholderGenerator(
+  placeholder: string | ParsedVideo,
+  targetDuration: number,
+): Generator<ParsedSegment> {
+  for (let i = 0;; ++i) {
+    if (typeof placeholder === "string") {
+      yield {
+        segment: new HLS.types.Segment({
+          uri: placeholder,
+          duration: targetDuration,
+          mediaSequenceNumber: 0,
+          discontinuitySequence: 0,
+        }),
+        first: i === 0,
+      };
+    } else {
+      const segments = placeholder.hlsPlaylist.segments;
+      if (i % segments.length === 0) {
+        segments[0].discontinuity = true;
+      }
+      yield {
+        segment: segments[i % segments.length],
+        first: i === 0,
+        onPlay: placeholder.onPlay,
+      };
+    }
+  }
 }
 
-async function livePlaylist(options: LiveVideoPlaylistOptions) {
+async function* segmentGenerator(
+  videoIterator: AsyncIterator<ParsedVideo>,
+  placeholderGenerator: Iterable<ParsedSegment | null>,
+  checkPending: () => ParsedVideo | null,
+) {
+  for (let video = checkPending();;) {
+    if (!video) {
+      const p = videoIterator.next();
+      for (
+        const curPlaceholder of placeholderGenerator
+      ) {
+        const raceArray = curPlaceholder === null
+          ? [
+            delay(0).then(() => {
+              throw new Error(
+                "getNextVideo returned pending promise without placeholder",
+              );
+            }),
+            p,
+          ]
+          : [p, delay(0).then(() => curPlaceholder)];
+        const v = await Promise.race(raceArray);
+        video = checkPending();
+        if (video) {
+          break;
+        }
+        if ("segment" in v) {
+          yield v;
+        } else if (v.done) {
+          return;
+        } else {
+          video = v.value;
+          break;
+        }
+      }
+    }
+    asserts.assert(video);
+    for (let i = 0; i < video.hlsPlaylist.segments.length; i++) {
+      const segment = video.hlsPlaylist.segments[i];
+      if (i === 0) {
+        segment.discontinuity = true;
+      }
+      yield {
+        segment,
+        first: i === 0,
+        onPlay: video.onPlay,
+        onComplete: video.onComplete,
+      };
+      const pendingVideo = checkPending();
+      if (pendingVideo) {
+        video = pendingVideo;
+        break;
+      }
+    }
+  }
+}
+
+function livePlaylist(options: LiveVideoPlaylistOptions) {
   const { targetDuration } = options;
   let pendingVideo: ParsedVideo | null = null;
   let discontinuitySequence = 0;
@@ -77,28 +164,19 @@ async function livePlaylist(options: LiveVideoPlaylistOptions) {
   ) {
     throw new Error("target duration must be a positive integer");
   }
-  const placeholder = typeof options.fallbackPlaceholder === "string"
-    ? options.fallbackPlaceholder
-    : parseHlsPlaylist(options.fallbackPlaceholder.hlsPlaylist);
+  let placeholder: string | ParsedVideo | undefined;
+  try {
+    placeholder = (typeof options.fallbackPlaceholder === "string" ||
+        !options.fallbackPlaceholder)
+      ? options.fallbackPlaceholder
+      : {
+        ...options.fallbackPlaceholder,
+        hlsPlaylist: parseHlsPlaylist(options.fallbackPlaceholder.hlsPlaylist),
+      };
+  } catch (err) {
+    throw new Error("failed to parse placeholder playlist: " + err.message);
+  }
 
-  const placeholderGenerator = function* () {
-    for (let i = 0;; ++i) {
-      if (typeof placeholder === "string") {
-        yield new HLS.types.Segment({
-          uri: placeholder,
-          duration: targetDuration,
-          mediaSequenceNumber: 0,
-          discontinuitySequence: 0,
-        });
-      } else {
-        const segments = placeholder.segments;
-        if (i % segments.length === 0) {
-          segments[0].discontinuity = true;
-        }
-        yield segments[i % segments.length];
-      }
-    }
-  };
   const userVideoIterable = (async function* () {
     for await (const v of getNextVideo(options.getNextVideo)) {
       try {
@@ -107,48 +185,14 @@ async function livePlaylist(options: LiveVideoPlaylistOptions) {
           hlsPlaylist: parseHlsPlaylist(v.hlsPlaylist),
         } as ParsedVideo;
       } catch (err) {
-        v.onError?.(err);
-      }
-    }
-  })();
-  const segmentIterable = (async function* () {
-    for (;;) {
-      let video: ParsedVideo | null = pendingVideo;
-      if (video) {
-        pendingVideo = null;
-      } else {
-        const p = userVideoIterable.next();
-        for (const placeholder of placeholderGenerator()) {
-          const v = await getPromiseOrFallback(p, placeholder);
-          if (pendingVideo) {
-            video = pendingVideo;
-            pendingVideo = null;
-            break;
-          }
-          if (v instanceof HLS.types.Segment) {
-            yield v;
-          } else if (v.done) {
-            return;
-          } else {
-            video = v.value;
-            break;
-          }
-        }
-      }
-      asserts.assert(video);
-      for (let i = 0; i < video.hlsPlaylist.segments.length; i++) {
-        const segment = video.hlsPlaylist.segments[i];
-        if (i === 0) {
-          segment.discontinuity = true;
-        }
-        yield segment;
-        if (pendingVideo) {
-          break;
+        if (v.onError) {
+          v.onError(err);
+        } else {
+          console.warn("failed to parse playlist: " + err.message);
         }
       }
     }
   })();
-
   function parseHlsPlaylist(
     playlist: string,
   ): HLSPlaylist {
@@ -167,15 +211,86 @@ async function livePlaylist(options: LiveVideoPlaylistOptions) {
     }
     return parsedPlaylist;
   }
+  const segmentIterator = segmentGenerator(
+    userVideoIterable,
+    placeholder ? placeholderGenerator(placeholder, targetDuration) : [null],
+    () => {
+      if (pendingVideo) {
+        const v = pendingVideo;
+        pendingVideo = null;
+        return v;
+      }
+      return null;
+    },
+  );
 
-  async function fillPlaylist(existing: HLSSegment[]) {
-    const ret = existing.slice();
-    while (getDuration(ret) < MIN_PLAYLIST_TD_MULTIPLE * targetDuration) {
-      ret.push(await segmentIterable.next());
+  type SegmentDescriptor = ParsedSegment & {
+    addedToPlaylistMs: number;
+    availabilityDurationMs: number;
+    startTimeMs: number;
+  };
+  let segments: SegmentDescriptor[] = [];
+  let nextUpdate: ReturnType<typeof setTimeout> | null = null;
+
+  async function fillPlaylist(
+    minLengthMs: number,
+  ) {
+    const ret: SegmentDescriptor[] = [];
+    while (
+      getSegmentsDurationMs(ret) < minLengthMs
+    ) {
+      const s = await segmentIterator.next();
+      if (s.done) {
+        break;
+      }
+      s.value.segment.mediaSequenceNumber = mediaSequenceNumber++;
+      if (s.value.segment.discontinuity) {
+        discontinuitySequence++;
+      }
+      s.value.segment.discontinuitySequence = discontinuitySequence;
+      ret.push({
+        ...s.value,
+        addedToPlaylistMs: 0,
+        startTimeMs: 0,
+        availabilityDurationMs: 0,
+      });
+    }
+    return ret;
+  }
+
+  async function update() {
+    const now = Date.now();
+    const lastSegment = segments[segments.length - 1];
+    const playlistEndTime = lastSegment
+      ? lastSegment.startTimeMs +
+        lastSegment.segment.duration * 1000
+      : now;
+    const fillAmount = Math.max(
+      playlistEndTime - (targetDuration * MIN_PLAYLIST_TD_MULTIPLE * 1000),
+      now,
+    );
+    const newSegs = await fillPlaylist(
+      fillAmount,
+    );
+  }
+
+  async function start() {
+    const segs: SegmentDescriptor[] = await fillPlaylist(
+      MIN_PLAYLIST_TD_MULTIPLE * targetDuration * 1000,
+    );
+    updateAvailabilityDurations(segs);
+    segments = segs;
+  }
+
+  function updateAvailabilityDurations(segments: SegmentDescriptor[]) {
+    const playlistDurationMs = getSegmentsDurationMs(segments);
+    for (const s of segments) {
+      const newAd = playlistDurationMs + (s.segment.duration * 1000);
+      s.availabilityDurationMs = Math.max(s.availabilityDurationMs, newAd);
     }
   }
 
-  function playNow(video: IVideo) {
+  function playNext(video: IVideo) {
     try {
       pendingVideo = {
         ...video,
@@ -186,9 +301,7 @@ async function livePlaylist(options: LiveVideoPlaylistOptions) {
     }
   }
 
-  await 1;
-
-  return { playNow };
+  return { start, playNext };
 }
 
 export default livePlaylist;

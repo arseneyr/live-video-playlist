@@ -52,7 +52,7 @@ Deno.test("pending getNextVideo without placeholder", async () => {
     hlsPlaylist: samplePlaylist,
   }));
   const createFakeOptions = () => ({
-    getNextVideo: async () => ({ hlsPlaylist: samplePlaylist }),
+    getNextVideo: () => nextVideoPromise,
     targetDuration: 1,
   });
   const { start } = livePlaylist(createFakeOptions());

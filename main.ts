@@ -98,22 +98,25 @@ function* placeholderGenerator(
 
 async function* segmentGenerator(
   videoIterator: AsyncIterator<ParsedVideo>,
-  placeholderGenerator: Iterable<ParsedSegment | null>,
+  placeholderGenerator: Iterable<ParsedSegment> | null,
   checkPending: () => ParsedVideo | null,
 ) {
   for (let video = checkPending();;) {
     if (!video) {
+      const errPromise = !placeholderGenerator
+        ? delay(0).then(() => {
+          throw new Error(
+            "getNextVideo returned pending promise without placeholder",
+          );
+        })
+        : undefined;
       const p = videoIterator.next();
       for (
-        const curPlaceholder of placeholderGenerator
+        const curPlaceholder of placeholderGenerator ?? [null]
       ) {
         const raceArray = curPlaceholder === null
           ? [
-            delay(0).then(() => {
-              throw new Error(
-                "getNextVideo returned pending promise without placeholder",
-              );
-            }),
+            errPromise!,
             p,
           ]
           : [p, delay(0).then(() => curPlaceholder)];
@@ -133,6 +136,7 @@ async function* segmentGenerator(
       }
     }
     asserts.assert(video);
+    let pendingVideo = null;
     for (let i = 0; i < video.hlsPlaylist.segments.length; i++) {
       const segment = video.hlsPlaylist.segments[i];
       if (i === 0) {
@@ -144,7 +148,7 @@ async function* segmentGenerator(
         onPlay: video.onPlay,
         onComplete: video.onComplete,
       };
-      const pendingVideo = checkPending();
+      pendingVideo = checkPending();
       if (pendingVideo) {
         video = pendingVideo;
         break;
@@ -213,7 +217,7 @@ function livePlaylist(options: LiveVideoPlaylistOptions) {
   }
   const segmentIterator = segmentGenerator(
     userVideoIterable,
-    placeholder ? placeholderGenerator(placeholder, targetDuration) : [null],
+    placeholder ? placeholderGenerator(placeholder, targetDuration) : null,
     () => {
       if (pendingVideo) {
         const v = pendingVideo;

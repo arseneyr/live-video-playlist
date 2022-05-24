@@ -18,7 +18,6 @@ const samplePlaylist = HLS.stringify(
 Deno.test("invalid target duration", () => {
   const createFakeOptions = (targetDuration: number) => ({
     getNextVideo: () => ({ hlsPlaylist: "" }),
-    fallbackPlaceholder: "",
     targetDuration,
   });
   asserts.assertThrows(
@@ -35,7 +34,7 @@ Deno.test("invalid target duration", () => {
 
 Deno.test("invalid placeholder playlist", () => {
   const createFakeOptions = () => ({
-    getNextVideo: () => ({ hlsPlaylist: "" }),
+    getNextVideo: () => Promise.resolve({ hlsPlaylist: "" }),
     fallbackPlaceholder: {
       hlsPlaylist: "",
     },
@@ -55,11 +54,12 @@ Deno.test("pending getNextVideo without placeholder", async () => {
     getNextVideo: () => nextVideoPromise,
     targetDuration: 1,
   });
+  // @ts-expect-error: invalid parameter combination
   const { start } = livePlaylist(createFakeOptions());
   await asserts.assertRejects(
     start,
     Error,
-    "pending",
+    "async getNextVideo",
   );
   await nextVideoPromise;
 });
